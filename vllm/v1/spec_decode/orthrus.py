@@ -113,17 +113,35 @@ class _DiffusionGraph:
         )
 
     def capture(self) -> None:
-        """Warm up (FLA autotune etc.) and capture. Buffers must already hold
-        a valid request state so warmup touches real cache slots."""
+        """Warm up (FLA autotune, optional torch.compile) and capture.
+        Buffers must already hold a valid request state so warmup touches
+        real cache slots.
+
+        torch.compile fuses the long elementwise/cat/reduce tail of the eager
+        diffusion pass (~3000 tiny kernels) before graph capture; graph breaks
+        at the FLA Triton kernels are harmless because the captured CUDA graph
+        eliminates the CPU dispatch between subgraphs anyway."""
+        fn = self._forward
+        if os.environ.get("ORTHRUS_COMPILE_DRAFT", "1") != "0":
+            try:
+                compiled = torch.compile(self._forward, dynamic=False)
+                compiled()  # compile + smoke outside the capture stream
+                torch.cuda.synchronize()
+                fn = compiled
+            except Exception:
+                logger.exception(
+                    "Orthrus: torch.compile of diffusion forward failed; "
+                    "capturing the eager version"
+                )
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for _ in range(3):
-                self._forward()
+                fn()
         torch.cuda.current_stream().wait_stream(stream)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            self._forward()
+            fn()
         self.graph = graph
 
     def fill(
@@ -173,6 +191,21 @@ class _DiffusionGraph:
         self.graph.replay()
         return self.draft_out.tolist()
 
+    def profile_once(self) -> None:
+        """Dump a per-kernel table of one replay (ORTHRUS_PROFILE=1)."""
+        torch.cuda.synchronize()
+        from torch.profiler import ProfilerActivity, profile
+
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            self.graph.replay()
+            torch.cuda.synchronize()
+        print(
+            prof.key_averages().table(
+                sort_by="cuda_time_total", row_limit=25
+            ),
+            flush=True,
+        )
+
 
 class OrthrusProposer:
     def __init__(self, vllm_config: VllmConfig, device: torch.device, runner):
@@ -208,7 +241,10 @@ class OrthrusProposer:
             os.environ.get("ORTHRUS_DRAFT_CUDAGRAPH", "1") != "0"
             and not vllm_config.model_config.enforce_eager
         )
-        self._graph: _DiffusionGraph | None = None
+        # One graph per prefix bucket (power-of-two page counts): the dense
+        # prefix gather + masked SDPA cost scales with the captured prefix
+        # length, so short sequences shouldn't pay for max_model_len.
+        self._graphs: dict[int, _DiffusionGraph] = {}
 
         # Resolved lazily (KV caches don't exist at construction time).
         self._layer_maps = None
@@ -251,12 +287,17 @@ class OrthrusProposer:
         self._layer_maps = (attn_map, gdn_map, attn_block_size, kernel_bs)
         return self._layer_maps
 
-    def _get_graph(self) -> "_DiffusionGraph":
-        if self._graph is None:
-            attn_map, gdn_map, attn_block_size, kernel_bs = self._layer_maps
-            kernel_block = next(iter(kernel_bs.values()))
-            max_pages = -(-self.runner.max_model_len // kernel_block)
-            self._graph = _DiffusionGraph(
+    def _get_graph(self, cur: int) -> "_DiffusionGraph":
+        attn_map, gdn_map, attn_block_size, kernel_bs = self._layer_maps
+        kernel_block = next(iter(kernel_bs.values()))
+        limit = -(-self.runner.max_model_len // kernel_block)
+        needed = max(-(-cur // kernel_block), 1)
+        bucket = 64
+        while bucket < needed:
+            bucket *= 2
+        bucket = min(bucket, limit)
+        if bucket not in self._graphs:
+            self._graphs[bucket] = _DiffusionGraph(
                 self.runner.model,
                 self.K,
                 self.num_spec_tokens,
@@ -264,10 +305,10 @@ class OrthrusProposer:
                 gdn_map,
                 attn_block_size,
                 kernel_bs,
-                max_pages,
+                bucket,
                 self.device,
             )
-        return self._graph
+        return self._graphs[bucket]
 
     def propose(
         self,
@@ -309,7 +350,7 @@ class OrthrusProposer:
 
             block_ids = req_state.block_ids
             if self.use_graph:
-                graph = self._get_graph()
+                graph = self._get_graph(cur)
                 if graph.fill(
                     anchor, self.mask_token_id, cur, block_ids, num_accepted
                 ):
@@ -325,6 +366,11 @@ class OrthrusProposer:
                             graph.max_pages,
                             self.stat_capture_s,
                         )
+                    if (
+                        os.environ.get("ORTHRUS_PROFILE") == "1"
+                        and self.stat_cycles == 40
+                    ):
+                        graph.profile_once()
                     drafts.append(graph.run())
                     continue
             drafts.append(
