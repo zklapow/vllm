@@ -63,6 +63,7 @@ SpeculativeMethod = Literal[
     "draft_model",
     "suffix",
     "custom_class",
+    "orthrus",
     EagleModelTypes,
     NgramGPUTypes,
 ]
@@ -573,6 +574,9 @@ class SpeculativeConfig:
                 self.model = "ngram_gpu"
             elif self.method == "suffix":
                 self.model = "suffix"
+            elif self.method == "orthrus":
+                # Orthrus drafts with the target model's own diffusion head.
+                self.model = "orthrus"
             elif self.method == "extract_hidden_states":
                 self.model = "extract_hidden_states"
             elif self.method == "custom_class":
@@ -626,6 +630,13 @@ class SpeculativeConfig:
             self.draft_parallel_config = self.target_parallel_config
         elif self.method == "suffix":
             self._validate_suffix_decoding()
+        elif self.method == "orthrus":
+            # Orthrus parallel block-diffusion drafting: the proposer runs the
+            # target model's diffusion head — no separate draft model.
+            self.prompt_lookup_max = 0
+            self.prompt_lookup_min = 0
+            self.draft_model_config = self.target_model_config
+            self.draft_parallel_config = self.target_parallel_config
         elif self.method == "custom_class":
             # Custom class proposer does not need a draft model.
             # It will dynamically load the user-provided class at runtime.
@@ -1072,6 +1083,9 @@ class SpeculativeConfig:
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
+
+    def use_orthrus(self) -> bool:
+        return self.method == "orthrus"
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

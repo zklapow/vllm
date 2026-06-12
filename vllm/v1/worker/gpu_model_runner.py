@@ -559,6 +559,12 @@ class GPUModelRunner(
                 self.drafter = create_custom_proposer(  # type: ignore[assignment]
                     self.vllm_config
                 )
+            elif self.speculative_config.use_orthrus():
+                from vllm.v1.spec_decode.orthrus import OrthrusProposer
+
+                self.drafter = OrthrusProposer(  # type: ignore[assignment]
+                    self.vllm_config, self.device, self
+                )
             elif self.speculative_config.method == "ngram":
                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
@@ -4833,6 +4839,12 @@ class GPUModelRunner(
                 self.input_batch.token_ids_cpu,
                 slot_mappings=slot_mappings,
             )
+        elif spec_config.use_orthrus():
+            from vllm.v1.spec_decode.orthrus import OrthrusProposer
+
+            assert isinstance(sampled_token_ids, list)
+            assert isinstance(self.drafter, OrthrusProposer)
+            draft_token_ids = self.drafter.propose(sampled_token_ids)
         elif spec_config.use_ngram_gpu():
             assert isinstance(self.drafter, NgramProposerGPU)
             (

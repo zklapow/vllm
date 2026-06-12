@@ -183,6 +183,7 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
         attn_block_tables: dict[int, torch.Tensor],
         attn_block_size: int,
         gdn_state_indices: dict[int, int],
+        gdn_conv_offset: int = 0,
     ) -> torch.Tensor:
         """One parallel diffusion pass over a K-token block.
 
@@ -195,7 +196,13 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
                 layer's KV-cache group (hybrid models split layers across
                 several groups, so the page ids are per-layer).
             attn_block_size: tokens per KV page.
-            gdn_state_indices: layer_idx -> this request's GDN state slot.
+            gdn_state_indices: layer_idx -> (conv_state_idx, ssm_state_idx)
+                or a single int used for both. Under spec decode the conv
+                window lives in slot 0 (sliding, select via gdn_conv_offset)
+                while the recurrent state of the committed prefix is the
+                accepted per-draft-step slot.
+            gdn_conv_offset: first column of the committed conv window inside
+                the conv state slot (= num_accepted - 1; 0 without spec).
 
         Returns:
             (K, vocab) logits. Position i predicts the token at ``cur+i+1``
@@ -212,8 +219,10 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
             residual = hidden
             h = layer.input_layernorm(hidden)
             if layer.layer_type == "linear_attention":
+                idx = gdn_state_indices[layer.layer_idx]
+                conv_idx, ssm_idx = idx if isinstance(idx, tuple) else (idx, idx)
                 h = self._gdn_diffusion(
-                    layer.linear_attn, h, gdn_state_indices[layer.layer_idx]
+                    layer.linear_attn, h, conv_idx, ssm_idx, gdn_conv_offset
                 )
             else:
                 h = self._attn_diffusion(
@@ -323,7 +332,14 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
         v = v_cache.index_select(0, pages).reshape(-1, num_kv_heads, head_dim)
         return k[:seq_len], v[:seq_len]
 
-    def _gdn_diffusion(self, dn, h: torch.Tensor, state_idx: int) -> torch.Tensor:
+    def _gdn_diffusion(
+        self,
+        dn,
+        h: torch.Tensor,
+        conv_state_idx: int,
+        ssm_state_idx: int,
+        conv_offset: int = 0,
+    ) -> torch.Tensor:
         """Diffusion GDN: diff conv (seeded by AR conv state) + dual-scan
         bidirectional delta rule seeded by the AR recurrent state."""
         num_tokens = h.shape[0]
@@ -333,8 +349,11 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
         ssm_pool = dn.kv_cache[1]
         if not is_conv_state_dim_first():
             conv_pool = conv_pool.transpose(-1, -2)
-        # (conv_dim, kernel-1) most-recent-last window of pre-conv columns.
-        conv_state = conv_pool[state_idx, :, -(dn.conv_kernel_size - 1) :]
+        # (conv_dim, kernel-1) most-recent-last window of pre-conv columns of
+        # the committed prefix. Under spec decode the slot is wider
+        # (kernel-1+num_spec) and the committed window starts at conv_offset.
+        width = dn.conv_kernel_size - 1
+        conv_state = conv_pool[conv_state_idx, :, conv_offset : conv_offset + width]
 
         window = torch.cat([conv_state.to(mixed.dtype), mixed.t()], dim=-1)
         conv_out = F.conv1d(
@@ -359,7 +378,7 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
 
         # Dual scan in ONE kernel call: row 0 forward (seeded by the AR
         # recurrent state), row 1 the flipped block from a zero state.
-        init_fwd = ssm_pool[state_idx].unsqueeze(0)
+        init_fwd = ssm_pool[ssm_state_idx].unsqueeze(0)
         q2 = torch.cat([q, torch.flip(q, dims=[1])], dim=0)
         k2 = torch.cat([k, torch.flip(k, dims=[1])], dim=0)
         v2 = torch.cat([v, torch.flip(v, dims=[1])], dim=0)
