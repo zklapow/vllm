@@ -133,6 +133,8 @@ on acceptance, not output equality.
 | M2 best (re-measured, K=16)              | 121-136 | 163-176 | 3.57 | 19.0-21.4 |
 | 1. inline norms in the compile region    | 151.7 | 176.2 | 3.48 | 14.4 |
 | 2. + ORTHRUS_FP8_DRAFT=full              | 160.1 | 187.2 | 3.55 | 13.3 |
+| 3. + scaled_mm use_fast_accum (FINAL)    | 162.3 | 184.9 | 3.58 | 13.2 |
+| 4. + ORTHRUS_FWD_ONLY_SCAN=1 (rejected)  | 160.7 | 180.6 | 3.52 | 13.3 |
 
 - Increment 1: GemmaRMSNorm / RMSNormGated modules route through opaque IR
   ops that stayed eager at the torch.compile boundary — 161 reduce kernels +
@@ -147,7 +149,22 @@ on acceptance, not output equality.
   AR/verify path stays bf16-exact). Dynamic per-token activation scales +
   per-channel weight scales via rowwise `torch._scaled_mm` (sm100 OK).
   Acceptance 3.55 vs 3.57 bf16 — no real drop; lossless 3/3 byte-identical.
-  First capture pays ~2min of max-autotune over the fp8 GEMM shapes.
+  First capture pays ~2min of max-autotune over the fp8 GEMM shapes
+  (persisted in the inductor cache; later loads are fast).
+- Increment 4 (rejected): `ORTHRUS_FWD_ONLY_SCAN=1` saved nothing — the
+  dual scan is one batch-2 FLA call whose kernels are latency-bound at
+  T=16, so halving the batch doesn't shorten them. Acceptance held
+  (3.52); knob kept for future K sweeps but off by default.
+- Remaining 13.2ms decomposition (profiled replay 12.4ms CUDA + ~1ms
+  fill/sync wall overhead): fp8 GEMM templates ~6.5ms (M=16 triton fp8 mm
+  runs at ~40% of HBM bw — the new floor; fast-accum changed little),
+  FLA chunk kernels ~1.4ms, SDPA template 0.42ms, quant/norm reductions
+  ~0.9ms, gathers ~0.4ms, conv 0.22ms, fused elementwise rest.
+- Where this lands vs the M3 goal: drafter 19 -> 13.2ms at unchanged
+  acceptance; cycle ~27.6ms; tpf 4.58 (>= 4.4 gate). The remaining lever
+  to the MTP bar is still acceptance (Run 18/19 K=48 checkpoints).
+- The :8400 launcher (`~/bin_serve_orthrus_g6.sh`) now exports
+  `ORTHRUS_FP8_DRAFT=full ORTHRUS_COMPILE_MODE=max-autotune-no-cudagraphs`.
 
 ## Notes / gotchas discovered
 - Internal request ids are randomized; `LLMEngine.add_request` returns the
