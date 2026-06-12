@@ -83,10 +83,23 @@ baseline of 85.0 tok/s measured on this fork; banked MTP bar 236 tok/s):
 | 3. drafter CUDA graph, max-len prefix     | 86.0  | 100.3 | 3.54 | 38.2 |
 | 3b. bucketed prefix graphs (64-page)      | 102.6 | 116.4 | 3.74 | 30.5 |
 | 3c. torch.compile + capture (K=16)        | 133.2 | 160.2 | 3.60 | 19.6 |
+| 3c at K=32                                | 127.9 | 151.0 | 3.64 | 19.3 |
+| 3c + ORTHRUS_COMPILE_MODE=max-autotune-no-cudagraphs | 136.4 | 163.2 | 3.62 | 19.0 |
 
 - K sweep at speed (increment 3): K=16 86.0 / K=32 84.7 / K=48 79.9 tok/s;
   acceptance only 3.54 -> 3.64, so larger K does not pay for run17 weights on
   these prompts. K=16 is the operating point.
+- Remaining gap to the MTP bar (236 tok/s code prompt), decomposed: cycle is
+  ~33ms = ~14.4ms verify+engine (parity with MTP's whole 15.2ms cycle) +
+  ~19ms drafter. Drafter replay is 18.5ms CUDA: 9.4ms weight GEMMs (floor —
+  the diffusion pass is a full-depth 64-layer forward; MTP's drafter is one
+  layer, ~1ms), ~2ms FLA dual-scan, ~1ms fp32 SDPA, rest fused elementwise.
+  At 19ms drafter the bar needs tpf ~7.9; our tpf is 4.6 (already above
+  MTP's accept-len 3.59 — Orthrus loses purely on drafter depth). The lever
+  is acceptance: with the K=48-trained Run 18/19 checkpoints at accept ~7-8
+  (prototype saw ~11 on code), the same engine clears 236. Option-A paged
+  diffusion attention was not built: the dense gather is already a single
+  fused triton kernel at ~0.6ms/replay and is not on the critical path.
 - Drafter graphs: `OrthrusProposer` captures `diffusion_forward` in *static
   mode* (fixed K, power-of-two page-bucket prefix, gather-everything +
   additive validity bias from a 0-dim `seq_len` tensor; GDN state slots
