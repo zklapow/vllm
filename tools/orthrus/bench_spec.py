@@ -97,6 +97,9 @@ def main() -> None:
                 print(f"acceptance: {accepted} drafts accepted over {cycles} "
                       f"cycles = {accepted / cycles:.2f} avg accepted/cycle "
                       f"(tpf ~ {1 + accepted / cycles:.2f})")
+                print(f"propose time: {drafter.stat_propose_s:.2f}s total "
+                      f"= {1e3 * drafter.stat_propose_s / cycles:.1f} "
+                      f"ms/cycle (cycles incl. prefill propose)")
         except AttributeError as e:
             print(f"(no drafter stats: {e})")
 

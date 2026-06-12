@@ -7,9 +7,12 @@ The draft "model" is the target model's own diffusion head
 [anchor, mask x K-1] at positions [cur, cur+K) reading the target's paged KV
 and GDN states. K = num_speculative_tokens + 1.
 
-M1 scope: greedy, eager, CPU-list proposer path (runs after bookkeeping like
-ngram). Each request is drafted with a separate bs=1 diffusion forward —
-correct for any batch size, optimized later (M3 batches the block dim).
+CPU-list proposer path (runs after bookkeeping like ngram). bs=1 requests are
+drafted through a manually captured CUDA graph of ``diffusion_forward`` in
+static mode (fixed K, fixed max-prefix page buffer, validity carried by an
+additive bias built from a device scalar — same pattern as the prototype's
+static_infer.py). Anything else (bs>1, prefix overflow) falls back to the
+eager per-request path, which stays bit-equivalent in output structure.
 
 State-slot conventions (see gdn_attn.py + fused_sigmoid_gating.py +
 causal_conv1d.py): with ``a = len(sampled)`` accepted tokens in the step that
@@ -18,12 +21,157 @@ just ran, the GDN recurrent state after the committed prefix is slot
 ``block_ids[0]``.
 """
 
+import os
+
 import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+class _DiffusionGraph:
+    """One captured CUDA graph of the static-mode diffusion forward.
+
+    All inputs live in fixed device buffers; per-cycle host work is a handful
+    of small async H2D copies followed by ``graph.replay()`` and one D2H sync
+    to read the K-1 drafted token ids.
+    """
+
+    def __init__(
+        self,
+        model,
+        K: int,
+        num_spec_tokens: int,
+        attn_map: dict[int, int],
+        gdn_map: dict[int, int],
+        attn_block_size: int,
+        kernel_bs: dict[int, int],
+        max_pages: int,
+        device: torch.device,
+    ):
+        self.model = model
+        self.K = K
+        self.num_spec_tokens = num_spec_tokens
+        self.max_pages = max_pages
+        self.kernel_block_size = next(iter(kernel_bs.values()))
+        self.attn_block_size = attn_block_size
+        self.kernel_bs = kernel_bs
+
+        attn_groups = set(attn_map.values())
+        assert len(attn_groups) == 1, "expected a single attention KV group"
+        self.attn_group = next(iter(attn_groups))
+        self.gdn_groups = sorted(set(gdn_map.values()))
+
+        dev = device
+        self.input_ids = torch.zeros(K, dtype=torch.long, device=dev)
+        self.positions = torch.zeros(K, dtype=torch.long, device=dev)
+        self.seq_len_t = torch.zeros((), dtype=torch.long, device=dev)
+        self.pages = torch.zeros(max_pages, dtype=torch.long, device=dev)
+        self.conv_idx = {
+            gi: torch.zeros(1, dtype=torch.long, device=dev)
+            for gi in self.gdn_groups
+        }
+        self.ssm_idx = {
+            gi: torch.zeros(1, dtype=torch.long, device=dev)
+            for gi in self.gdn_groups
+        }
+        self.conv_off = torch.zeros((), dtype=torch.long, device=dev)
+        self.draft_out = torch.zeros(
+            num_spec_tokens, dtype=torch.long, device=dev
+        )
+
+        # Pinned host staging buffers (one per device buffer: each is the
+        # source of an async H2D copy and must not be reused mid-flight).
+        self.host_tokens = torch.zeros(K, dtype=torch.long, pin_memory=True)
+        self.host_pos = torch.zeros(K, dtype=torch.long, pin_memory=True)
+        self.host_pages = torch.zeros(
+            max_pages, dtype=torch.long, pin_memory=True
+        )
+        self._ratio = attn_block_size // kernel_bs[self.attn_group]
+
+        self.attn_bts = {li: self.pages for li in attn_map}
+        self.gdn_idxs = {
+            li: (self.conv_idx[gi], self.ssm_idx[gi])
+            for li, gi in gdn_map.items()
+        }
+        self.graph: torch.cuda.CUDAGraph | None = None
+
+    def _forward(self) -> None:
+        logits = self.model.diffusion_forward(
+            input_ids=self.input_ids,
+            positions=self.positions,
+            seq_len=self.seq_len_t,
+            attn_block_tables=self.attn_bts,
+            attn_block_size=self.kernel_block_size,
+            gdn_state_indices=self.gdn_idxs,
+            gdn_conv_offset=self.conv_off,
+        )
+        torch.argmax(
+            logits[: self.num_spec_tokens], dim=-1, out=self.draft_out
+        )
+
+    def capture(self) -> None:
+        """Warm up (FLA autotune etc.) and capture. Buffers must already hold
+        a valid request state so warmup touches real cache slots."""
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                self._forward()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self._forward()
+        self.graph = graph
+
+    def fill(
+        self,
+        anchor: int,
+        mask_token_id: int,
+        cur: int,
+        block_ids,
+        num_accepted: int,
+    ) -> bool:
+        """Stage one request into the static buffers.
+
+        Returns False if the request does not fit (caller falls back to the
+        eager path)."""
+        needed = -(-cur // self.kernel_block_size)
+        if needed > self.max_pages:
+            return False
+
+        self.host_tokens.fill_(mask_token_id)
+        self.host_tokens[0] = anchor
+        self.input_ids.copy_(self.host_tokens, non_blocking=True)
+        torch.arange(cur, cur + self.K, out=self.host_pos)
+        self.positions.copy_(self.host_pos, non_blocking=True)
+        self.seq_len_t.fill_(cur)
+
+        blocks = torch.tensor(
+            block_ids[self.attn_group], dtype=torch.long
+        )
+        expanded = (
+            blocks.unsqueeze(1) * self._ratio
+            + torch.arange(self._ratio, dtype=torch.long)
+        ).flatten()
+        n = min(expanded.numel(), self.max_pages)
+        self.host_pages[:n] = expanded[:n]
+        self.host_pages[n:] = 0  # null block; masked by the validity bias
+        self.pages.copy_(self.host_pages, non_blocking=True)
+
+        for gi in self.gdn_groups:
+            row = block_ids[gi]
+            self.conv_idx[gi].fill_(row[0])
+            self.ssm_idx[gi].fill_(row[min(num_accepted, len(row)) - 1])
+        self.conv_off.fill_(num_accepted - 1)
+        return True
+
+    def run(self) -> list[int]:
+        assert self.graph is not None
+        self.graph.replay()
+        return self.draft_out.tolist()
 
 
 class OrthrusProposer:
@@ -53,6 +201,15 @@ class OrthrusProposer:
                 trained_k,
             )
 
+        # CUDA-graph drafting (default on; ORTHRUS_DRAFT_CUDAGRAPH=0 to
+        # force the eager per-request path). Also disabled when the engine
+        # itself is eager.
+        self.use_graph = (
+            os.environ.get("ORTHRUS_DRAFT_CUDAGRAPH", "1") != "0"
+            and not vllm_config.model_config.enforce_eager
+        )
+        self._graph: _DiffusionGraph | None = None
+
         # Resolved lazily (KV caches don't exist at construction time).
         self._layer_maps = None
 
@@ -60,6 +217,9 @@ class OrthrusProposer:
         # len(sampled)-1 of the previous cycle's drafts were accepted.
         self.stat_cycles = 0
         self.stat_accepted = 0
+        # Wall-clock spent inside propose() (each call ends with a device
+        # sync at draft_out.tolist(), so this is honest GPU+CPU time).
+        self.stat_propose_s = 0.0
 
     def load_model(self, *args, **kwargs) -> None:
         # The "draft model" is the target model itself.
@@ -91,6 +251,24 @@ class OrthrusProposer:
         self._layer_maps = (attn_map, gdn_map, attn_block_size, kernel_bs)
         return self._layer_maps
 
+    def _get_graph(self) -> "_DiffusionGraph":
+        if self._graph is None:
+            attn_map, gdn_map, attn_block_size, kernel_bs = self._layer_maps
+            kernel_block = next(iter(kernel_bs.values()))
+            max_pages = -(-self.runner.max_model_len // kernel_block)
+            self._graph = _DiffusionGraph(
+                self.runner.model,
+                self.K,
+                self.num_spec_tokens,
+                attn_map,
+                gdn_map,
+                attn_block_size,
+                kernel_bs,
+                max_pages,
+                self.device,
+            )
+        return self._graph
+
     def propose(
         self,
         sampled_token_ids: list[list[int]],
@@ -102,10 +280,11 @@ class OrthrusProposer:
         includes this step's sampled tokens; the last sampled token (the
         anchor) has no KV/DN state yet.
         """
+        import time
+
+        t0 = time.perf_counter()
         runner = self.runner
-        model = runner.model
         maps = self._layer_maps or self._resolve_layer_maps()
-        attn_map, gdn_map, attn_block_size, kernel_bs = maps
 
         drafts: list[list[int]] = []
         for i, sampled in enumerate(sampled_token_ids):
@@ -129,41 +308,69 @@ class OrthrusProposer:
                 continue
 
             block_ids = req_state.block_ids
-            input_ids = torch.full(
-                (self.K,), self.mask_token_id, dtype=torch.long, device=self.device
+            if self.use_graph:
+                graph = self._get_graph()
+                if graph.fill(
+                    anchor, self.mask_token_id, cur, block_ids, num_accepted
+                ):
+                    if graph.graph is None:
+                        tc = time.perf_counter()
+                        graph.capture()
+                        self.stat_capture_s = time.perf_counter() - tc
+                        self.stat_propose_s -= self.stat_capture_s
+                        logger.info(
+                            "Orthrus: captured diffusion CUDA graph "
+                            "(K=%d, max_pages=%d) in %.1fs",
+                            self.K,
+                            graph.max_pages,
+                            self.stat_capture_s,
+                        )
+                    drafts.append(graph.run())
+                    continue
+            drafts.append(
+                self._propose_one_eager(maps, block_ids, anchor, cur, num_accepted)
             )
-            input_ids[0] = anchor
-            positions = torch.arange(
-                cur, cur + self.K, dtype=torch.long, device=self.device
-            )
-            attn_bts = {}
-            for li, gi in attn_map.items():
-                ratio = attn_block_size // kernel_bs[gi]
-                pages = [
-                    b * ratio + j for b in block_ids[gi] for j in range(ratio)
-                ]
-                attn_bts[li] = torch.tensor(
-                    pages, dtype=torch.long, device=self.device
-                )
-            gdn_idxs = {}
-            for li, gi in gdn_map.items():
-                row = block_ids[gi]
-                # Conv state: sliding window in slot row[0], committed window
-                # starts at column num_accepted-1. Recurrent state: the verify
-                # pass wrote per-draft-step states into row[j]; slot
-                # row[num_accepted-1] is the committed one. (After a
-                # prefill/non-spec step num_accepted == 1 -> row[0].)
-                gdn_idxs[li] = (row[0], row[min(num_accepted, len(row)) - 1])
-
-            logits = model.diffusion_forward(
-                input_ids=input_ids,
-                positions=positions,
-                seq_len=cur,
-                attn_block_tables=attn_bts,
-                attn_block_size=next(iter(kernel_bs.values())),
-                gdn_state_indices=gdn_idxs,
-                gdn_conv_offset=num_accepted - 1,
-            )
-            draft = logits[: self.num_spec_tokens].argmax(dim=-1).tolist()
-            drafts.append(draft)
+        self.stat_propose_s += time.perf_counter() - t0
         return drafts
+
+    def _propose_one_eager(
+        self, maps, block_ids, anchor: int, cur: int, num_accepted: int
+    ) -> list[int]:
+        attn_map, gdn_map, attn_block_size, kernel_bs = maps
+        input_ids = torch.full(
+            (self.K,), self.mask_token_id, dtype=torch.long, device=self.device
+        )
+        input_ids[0] = anchor
+        positions = torch.arange(
+            cur, cur + self.K, dtype=torch.long, device=self.device
+        )
+        # One expanded page tensor per KV-cache group, shared by every
+        # attention layer in that group (they have identical block ids).
+        group_pages: dict[int, torch.Tensor] = {}
+        for gi in set(attn_map.values()):
+            ratio = attn_block_size // kernel_bs[gi]
+            blocks = torch.tensor(block_ids[gi], dtype=torch.long)
+            pages = (blocks.unsqueeze(1) * ratio
+                     + torch.arange(ratio, dtype=torch.long)).flatten()
+            group_pages[gi] = pages.to(self.device, non_blocking=True)
+        attn_bts = {li: group_pages[gi] for li, gi in attn_map.items()}
+        gdn_idxs = {}
+        for li, gi in gdn_map.items():
+            row = block_ids[gi]
+            # Conv state: sliding window in slot row[0], committed window
+            # starts at column num_accepted-1. Recurrent state: the verify
+            # pass wrote per-draft-step states into row[j]; slot
+            # row[num_accepted-1] is the committed one. (After a
+            # prefill/non-spec step num_accepted == 1 -> row[0].)
+            gdn_idxs[li] = (row[0], row[min(num_accepted, len(row)) - 1])
+
+        logits = self.runner.model.diffusion_forward(
+            input_ids=input_ids,
+            positions=positions,
+            seq_len=cur,
+            attn_block_tables=attn_bts,
+            attn_block_size=next(iter(kernel_bs.values())),
+            gdn_state_indices=gdn_idxs,
+            gdn_conv_offset=num_accepted - 1,
+        )
+        return logits[: self.num_spec_tokens].argmax(dim=-1).tolist()
