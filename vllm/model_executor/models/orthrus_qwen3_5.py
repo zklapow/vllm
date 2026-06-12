@@ -94,7 +94,12 @@ def _fp8_linear(
     x_scale = amax / _FP8_MAX
     xq = (x.float() / x_scale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8_DTYPE)
     return torch._scaled_mm(
-        xq, wq.t(), scale_a=x_scale, scale_b=w_scale, out_dtype=x.dtype
+        xq,
+        wq.t(),
+        scale_a=x_scale,
+        scale_b=w_scale,
+        out_dtype=x.dtype,
+        use_fast_accum=True,
     )
 
 

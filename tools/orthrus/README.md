@@ -122,6 +122,33 @@ baseline of 85.0 tok/s measured on this fork; banked MTP bar 236 tok/s):
   inherent to any spec method on bf16 (incl. stock MTP), not a rollback or
   state bug.
 
+## M3 — drafter cost (2026-06-12)
+
+Goal: drafter 19ms -> ~12ms without losing acceptance. Drafter-only changes
+cannot break correctness (the target verifies everything), so they are gated
+on acceptance, not output equality.
+
+| increment | overall | code prompt | accept | propose ms/cycle |
+|---|---|---|---|---|
+| M2 best (re-measured, K=16)              | 121-136 | 163-176 | 3.57 | 19.0-21.4 |
+| 1. inline norms in the compile region    | 151.7 | 176.2 | 3.48 | 14.4 |
+| 2. + ORTHRUS_FP8_DRAFT=full              | 160.1 | 187.2 | 3.55 | 13.3 |
+
+- Increment 1: GemmaRMSNorm / RMSNormGated modules route through opaque IR
+  ops that stayed eager at the torch.compile boundary — 161 reduce kernels +
+  2x161 elementwise per replay (~2.4ms). Inlining the norm math as pure
+  torch in `diffusion_forward` lets inductor fuse them. Lossless check:
+  2/3 byte-identical, 1 prompt flips at a 1-ulp tie (expected tie-fragility,
+  same class as M2's intermediate variants).
+- Increment 2 (`ORTHRUS_FP8_DRAFT`): W8A8 e4m3 for the drafter-path GEMMs.
+  `diff` quantizes the *_diff projections in place (drafter-only weights,
+  frees ~7GB); `full` additionally makes fp8 *copies* of the shared
+  per-layer MLP + lm_head weights (~18GB, accounted before KV profiling;
+  AR/verify path stays bf16-exact). Dynamic per-token activation scales +
+  per-channel weight scales via rowwise `torch._scaled_mm` (sm100 OK).
+  Acceptance 3.55 vs 3.57 bf16 — no real drop; lossless 3/3 byte-identical.
+  First capture pays ~2min of max-autotune over the fp8 GEMM shapes.
+
 ## Notes / gotchas discovered
 - Internal request ids are randomized; `LLMEngine.add_request` returns the
   internal id (keys `runner.requests`), `RequestOutput.request_id` is the
