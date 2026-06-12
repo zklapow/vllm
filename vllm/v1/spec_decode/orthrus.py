@@ -124,7 +124,8 @@ class _DiffusionGraph:
         fn = self._forward
         if os.environ.get("ORTHRUS_COMPILE_DRAFT", "1") != "0":
             try:
-                compiled = torch.compile(self._forward, dynamic=False)
+                mode = os.environ.get("ORTHRUS_COMPILE_MODE") or None
+                compiled = torch.compile(self._forward, dynamic=False, mode=mode)
                 compiled()  # compile + smoke outside the capture stream
                 torch.cuda.synchronize()
                 fn = compiled

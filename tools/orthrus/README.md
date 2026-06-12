@@ -54,8 +54,10 @@ VLLM_ENABLE_V1_MULTIPROCESSING=0 CUDA_VISIBLE_DEVICES=6 \
     --model ~/checkpoints/orthrus/run17_27b/export_hf --k 16 \
     --reference ~/orthrus_m1/smoke_orthrus.json
 ```
-Serving: `vllm serve <export_hf> --speculative-config
-'{"method": "orthrus", "num_speculative_tokens": 15}' --enforce-eager`.
+Serving (M2: no --enforce-eager; engine cudagraphs + captured drafter):
+`vllm serve <export_hf> --speculative-config
+'{"method": "orthrus", "num_speculative_tokens": 15}' --max-num-seqs 1`.
+First request per prefix bucket pays a one-time drafter capture (1-8s).
 
 M1 results (2026-06-12, B200 GPU 6, bs=1 greedy, 128 tok, demo prompts,
 all eager):
@@ -68,6 +70,44 @@ all eager):
 - (banked cudagraph numbers from the 0.22.1 server for context: AR 89.7,
   MTP k=4 ~236 tok/s — closing that gap is M2/M3 work: cudagraph capture,
   batched diffusion, paged Option-A attention)
+
+## M2 — cudagraph speed (2026-06-12)
+
+Increments (bs=1 greedy, 256 tok, demo prompts, vs the M2 AR-cudagraph
+baseline of 85.0 tok/s measured on this fork; banked MTP bar 236 tok/s):
+
+| increment | overall | code prompt | accept | propose ms/cycle |
+|---|---|---|---|---|
+| M1 (all eager, K=32)                      | 38.6  | —     | 3.57 | — |
+| 1. engine cudagraphs, eager drafter (K=16)| 50.4  | 61.2  | 3.51 | ~75 |
+| 3. drafter CUDA graph, max-len prefix     | 86.0  | 100.3 | 3.54 | 38.2 |
+| 3b. bucketed prefix graphs (64-page)      | 102.6 | 116.4 | 3.74 | 30.5 |
+| 3c. torch.compile + capture (K=16)        | 133.2 | 160.2 | 3.60 | 19.6 |
+
+- K sweep at speed (increment 3): K=16 86.0 / K=32 84.7 / K=48 79.9 tok/s;
+  acceptance only 3.54 -> 3.64, so larger K does not pay for run17 weights on
+  these prompts. K=16 is the operating point.
+- Drafter graphs: `OrthrusProposer` captures `diffusion_forward` in *static
+  mode* (fixed K, power-of-two page-bucket prefix, gather-everything +
+  additive validity bias from a 0-dim `seq_len` tensor; GDN state slots
+  selected via device-tensor `index_select`). One graph per prefix bucket,
+  captured lazily; `ORTHRUS_DRAFT_CUDAGRAPH=0` forces eager,
+  `ORTHRUS_COMPILE_DRAFT=0` skips the torch.compile-before-capture step,
+  `ORTHRUS_PROFILE=1` dumps a kernel table of one replay at cycle 40.
+- Replay decomposition (uncompiled, 25.4ms): ~9.1ms weight GEMMs (floor —
+  same weights any K<=48 forward must read), ~8-10ms elementwise/cat/copy
+  zoo across ~3000 tiny kernels (what torch.compile fuses), ~2ms FLA chunk
+  kernels, ~1.2ms fp32 SDPA GEMMs.
+- LOSSLESSNESS: byte-identity vs the AR run is *tie-fragile*. Drafts change
+  acceptance boundaries -> the same committed token can be computed by a
+  different verify-chunk alignment -> bf16 logits move by 1 ulp -> argmax
+  flips when the top-2 logits are 1 ulp apart (0.125 at logit scale ~20).
+  `probe_margin.py` confirmed the only observed divergences are such
+  1-ulp ties (gap exactly 0.125 = 1 bf16 ulp; both candidates legitimate
+  greedy choices). Increment 3c is byte-identical 3/3; intermediate
+  numerics variants flipped 1-2 prompts at single tie points. This is
+  inherent to any spec method on bf16 (incl. stock MTP), not a rollback or
+  state bug.
 
 ## Notes / gotchas discovered
 - Internal request ids are randomized; `LLMEngine.add_request` returns the
