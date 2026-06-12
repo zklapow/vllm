@@ -168,7 +168,52 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
 
         loaded = super().load_weights(base_weights())
         logger.info("Orthrus: loaded %d diff tensors", len(diff_loaded))
+        self._fuse_diff_projections()
         return loaded | diff_loaded
+
+    def _fuse_diff_projections(self) -> None:
+        """Concatenate per-layer diff projection weights into single GEMMs.
+
+        The eager diffusion pass is launch-bound (64 layers x many small
+        matmuls); fusing the input projections cuts the launch count without
+        changing the math (one bf16 GEMM split afterwards). The original
+        nn.Linear modules are dropped to keep memory neutral.
+        """
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            if layer.layer_type == "full_attention":
+                attn = layer.self_attn
+                assert attn.q_proj_diff.bias is None
+                # Plain tensors (not Parameters): created post-load, so they
+                # must stay invisible to the loader's coverage tracking.
+                attn.diff_qkv_weight = torch.cat(
+                    [
+                        attn.q_proj_diff.weight,
+                        attn.k_proj_diff.weight,
+                        attn.v_proj_diff.weight,
+                    ],
+                    dim=0,
+                )
+                del attn.q_proj_diff, attn.k_proj_diff, attn.v_proj_diff
+            elif layer.layer_type == "linear_attention":
+                dn = layer.linear_attn
+                dn.diff_in_weight = torch.cat(
+                    [
+                        dn.in_proj_qkv_diff.weight,
+                        dn.in_proj_z_diff.weight,
+                        dn.in_proj_b_diff.weight,
+                        dn.in_proj_a_diff.weight,
+                    ],
+                    dim=0,
+                )
+                del (
+                    dn.in_proj_qkv_diff,
+                    dn.in_proj_z_diff,
+                    dn.in_proj_b_diff,
+                    dn.in_proj_a_diff,
+                )
+        torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # Orthrus diffusion forward (M1: dense-fallback attention, bs=1, eager)
@@ -179,11 +224,11 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        seq_len: int,
+        seq_len: "int | torch.Tensor",
         attn_block_tables: dict[int, torch.Tensor],
         attn_block_size: int,
         gdn_state_indices: dict[int, int],
-        gdn_conv_offset: int = 0,
+        gdn_conv_offset: "int | torch.Tensor" = 0,
     ) -> torch.Tensor:
         """One parallel diffusion pass over a K-token block.
 
@@ -191,18 +236,22 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
             input_ids: (K,) anchor token + K-1 mask tokens.
             positions: (K,) absolute positions ``[cur, cur+K)``.
             seq_len: committed prefix length ``cur`` (tokens whose KV/DN state
-                is already in the caches).
+                is already in the caches). May be a 0-dim device tensor: then
+                the pass runs in *static* (CUDA-graph capturable) mode — every
+                page in ``attn_block_tables`` is gathered (fixed shape) and an
+                additive bias built from ``seq_len`` masks the invalid slots.
             attn_block_tables: layer_idx -> page ids of this request in that
                 layer's KV-cache group (hybrid models split layers across
                 several groups, so the page ids are per-layer).
             attn_block_size: tokens per KV page.
             gdn_state_indices: layer_idx -> (conv_state_idx, ssm_state_idx)
-                or a single int used for both. Under spec decode the conv
-                window lives in slot 0 (sliding, select via gdn_conv_offset)
-                while the recurrent state of the committed prefix is the
-                accepted per-draft-step slot.
+                ints, or (1,) device tensors in static mode. Under spec decode
+                the conv window lives in slot 0 (sliding, select via
+                gdn_conv_offset) while the recurrent state of the committed
+                prefix is the accepted per-draft-step slot.
             gdn_conv_offset: first column of the committed conv window inside
                 the conv state slot (= num_accepted - 1; 0 without spec).
+                0-dim device tensor in static mode.
 
         Returns:
             (K, vocab) logits. Position i predicts the token at ``cur+i+1``
@@ -214,6 +263,27 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
         dense bidirectional K-block of diff K/V; GDN layers run the dual scan
         seeded by the request's recurrent state. Reads caches, writes nothing.
         """
+        static_mode = isinstance(seq_len, torch.Tensor)
+        if static_mode:
+            # Fixed-shape prefix: gather every page, mask validity with one
+            # additive bias shared by all attention layers.
+            any_pages = next(iter(attn_block_tables.values()))
+            prefix_len = any_pages.numel() * attn_block_size
+            kv_pos = torch.arange(prefix_len, device=input_ids.device)
+            num_tokens = input_ids.shape[0]
+            bias = torch.zeros(
+                prefix_len + num_tokens,
+                dtype=self.model.embed_tokens.weight.dtype,
+                device=input_ids.device,
+            )
+            bias[:prefix_len] = torch.where(
+                kv_pos < seq_len, 0.0, float("-inf")
+            ).to(bias.dtype)
+            attn_bias = bias[None, None, None, :]
+        else:
+            prefix_len = seq_len
+            attn_bias = None
+
         hidden = self.model.embed_tokens(input_ids)
         for layer in self.model.layers:
             residual = hidden
@@ -229,9 +299,10 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
                     layer.self_attn,
                     h,
                     positions,
-                    seq_len,
+                    prefix_len,
                     attn_block_tables[layer.layer_idx],
                     attn_block_size,
+                    attn_bias,
                 )
             hidden = residual + h
             residual = hidden
@@ -249,22 +320,34 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
         seq_len: int,
         block_table: torch.Tensor,
         block_size: int,
+        attn_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Diffusion attention: non-causal over [prefix KV from cache ‖ diff
-        block KV], dense fallback (single softmax — no LSE merge needed)."""
+        block KV], dense fallback (single softmax — no LSE merge needed).
+
+        ``seq_len`` here is the number of prefix tokens gathered from the
+        cache; in static mode that is all pages of ``block_table`` and
+        ``attn_bias`` (additive, broadcast over heads/queries) carries the
+        true-prefix validity instead."""
         num_tokens = h.shape[0]
         num_heads = attn.num_heads
         num_kv_heads = attn.num_kv_heads
         head_dim = attn.head_dim
 
-        qg = attn.q_proj_diff(h).view(num_tokens, num_heads, 2 * head_dim)
-        q, gate = qg.chunk(2, dim=-1)
+        qkv = F.linear(h, attn.diff_qkv_weight)
+        qg, k, v = qkv.split(
+            [
+                num_heads * head_dim * 2,
+                num_kv_heads * head_dim,
+                num_kv_heads * head_dim,
+            ],
+            dim=-1,
+        )
+        q, gate = qg.view(num_tokens, num_heads, 2 * head_dim).chunk(2, dim=-1)
         gate = gate.reshape(num_tokens, num_heads * head_dim)
         q = attn.q_norm_diff(q.contiguous())
-        k = attn.k_norm_diff(
-            attn.k_proj_diff(h).view(num_tokens, num_kv_heads, head_dim)
-        )
-        v = attn.v_proj_diff(h).view(num_tokens, num_kv_heads, head_dim)
+        k = attn.k_norm_diff(k.reshape(num_tokens, num_kv_heads, head_dim))
+        v = v.view(num_tokens, num_kv_heads, head_dim)
         q, k = attn.rotary_emb(
             positions, q.reshape(num_tokens, -1), k.reshape(num_tokens, -1)
         )
@@ -276,16 +359,14 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
         )
         k_all = torch.cat([k_pref.to(k.dtype), k], dim=0)
         v_all = torch.cat([v_pref.to(v.dtype), v], dim=0)
-        n_rep = num_heads // num_kv_heads
-        if n_rep > 1:
-            k_all = k_all.repeat_interleave(n_rep, dim=1)
-            v_all = v_all.repeat_interleave(n_rep, dim=1)
 
         out = F.scaled_dot_product_attention(
             q.transpose(0, 1).unsqueeze(0),
             k_all.transpose(0, 1).unsqueeze(0),
             v_all.transpose(0, 1).unsqueeze(0),
+            attn_mask=attn_bias,
             is_causal=False,
+            enable_gqa=True,
         )
         out = out.squeeze(0).transpose(0, 1).reshape(num_tokens, num_heads * head_dim)
         out = out * torch.sigmoid(gate)
@@ -336,14 +417,20 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
         self,
         dn,
         h: torch.Tensor,
-        conv_state_idx: int,
-        ssm_state_idx: int,
-        conv_offset: int = 0,
+        conv_state_idx: "int | torch.Tensor",
+        ssm_state_idx: "int | torch.Tensor",
+        conv_offset: "int | torch.Tensor" = 0,
     ) -> torch.Tensor:
         """Diffusion GDN: diff conv (seeded by AR conv state) + dual-scan
-        bidirectional delta rule seeded by the AR recurrent state."""
+        bidirectional delta rule seeded by the AR recurrent state.
+
+        Static (graph-capturable) mode: ``conv_state_idx``/``ssm_state_idx``
+        are (1,) device tensors and ``conv_offset`` a 0-dim device tensor."""
         num_tokens = h.shape[0]
-        mixed = dn.in_proj_qkv_diff(h)  # (K, conv_dim)
+        proj = F.linear(h, dn.diff_in_weight)
+        mixed, z_flat, b_raw, a_raw = proj.split(
+            [dn.conv_dim, dn.value_dim, dn.num_v_heads, dn.num_v_heads], dim=-1
+        )
 
         conv_pool = dn.kv_cache[0]
         ssm_pool = dn.kv_cache[1]
@@ -353,7 +440,20 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
         # the committed prefix. Under spec decode the slot is wider
         # (kernel-1+num_spec) and the committed window starts at conv_offset.
         width = dn.conv_kernel_size - 1
-        conv_state = conv_pool[conv_state_idx, :, conv_offset : conv_offset + width]
+        if isinstance(conv_state_idx, torch.Tensor):
+            cols = (
+                torch.arange(width, device=h.device, dtype=torch.long)
+                + conv_offset
+            )
+            conv_state = (
+                conv_pool.index_select(0, conv_state_idx)
+                .squeeze(0)
+                .index_select(-1, cols)
+            )
+        else:
+            conv_state = conv_pool[
+                conv_state_idx, :, conv_offset : conv_offset + width
+            ]
 
         window = torch.cat([conv_state.to(mixed.dtype), mixed.t()], dim=-1)
         conv_out = F.conv1d(
@@ -370,15 +470,18 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
             q = q.repeat_interleave(n_rep, dim=2)
             k = k.repeat_interleave(n_rep, dim=2)
 
-        beta = dn.in_proj_b_diff(h).sigmoid().view(1, num_tokens, dn.num_v_heads)
+        beta = b_raw.sigmoid().view(1, num_tokens, dn.num_v_heads)
         g = (
             -dn.A_log.float().exp()
-            * F.softplus(dn.in_proj_a_diff(h).float() + dn.dt_bias.float())
+            * F.softplus(a_raw.float() + dn.dt_bias.float())
         ).view(1, num_tokens, dn.num_v_heads)
 
         # Dual scan in ONE kernel call: row 0 forward (seeded by the AR
         # recurrent state), row 1 the flipped block from a zero state.
-        init_fwd = ssm_pool[ssm_state_idx].unsqueeze(0)
+        if isinstance(ssm_state_idx, torch.Tensor):
+            init_fwd = ssm_pool.index_select(0, ssm_state_idx)
+        else:
+            init_fwd = ssm_pool[ssm_state_idx].unsqueeze(0)
         q2 = torch.cat([q, torch.flip(q, dims=[1])], dim=0)
         k2 = torch.cat([k, torch.flip(k, dims=[1])], dim=0)
         v2 = torch.cat([v, torch.flip(v, dims=[1])], dim=0)
@@ -398,7 +501,7 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
         )
         core = out2[0] + torch.flip(out2[1], dims=[0])  # (K, H, head_v_dim)
 
-        z = dn.in_proj_z_diff(h).reshape(-1, dn.head_v_dim)
+        z = z_flat.reshape(-1, dn.head_v_dim)
         core = core.reshape(-1, dn.head_v_dim)
         core = dn.norm(core, z)
         core = core.reshape(num_tokens, dn.value_dim)
