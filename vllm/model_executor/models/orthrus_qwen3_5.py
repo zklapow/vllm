@@ -20,6 +20,7 @@ NOTE: the diff modules are plain (non-tensor-parallel) layers; M1 targets
 TP=1, bs=1 greedy. See docs/orthrus/INTEGRATION_PLAN.md.
 """
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -46,6 +47,55 @@ from .qwen3_5 import Qwen3_5ForCausalLMBase
 from .utils import PPMissingLayer
 
 logger = init_logger(__name__)
+
+# M3 drafter-speed knobs (drafter-only: the target model verifies every
+# draft, so these can only move acceptance, never correctness).
+#   ORTHRUS_FP8_DRAFT=diff  quantize the *_diff projections to fp8 in place
+#   ORTHRUS_FP8_DRAFT=full  also fp8-copy the shared MLP + lm_head weights
+#                           for the diffusion pass (AR/verify stays bf16)
+#   ORTHRUS_FWD_ONLY_SCAN=1 skip the backward DN scan (halves scan cost;
+#                           the head was trained bidirectional, expect an
+#                           acceptance drop)
+_FWD_ONLY_SCAN = os.environ.get("ORTHRUS_FWD_ONLY_SCAN", "0") == "1"
+
+_FP8_DTYPE = torch.float8_e4m3fn
+_FP8_MAX = torch.finfo(_FP8_DTYPE).max
+
+
+def _gemma_rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Inline GemmaRMSNorm (x * (1+w), fp32 mul then cast).
+
+    The module's forward routes through an opaque IR op that stays eager at
+    the torch.compile boundary (161 separate reduce+elementwise kernels per
+    drafter replay); pure-torch math here lets inductor fuse them into the
+    surrounding graph."""
+    xf = x.float()
+    xf = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return (xf * (1.0 + weight.float())).to(x.dtype)
+
+
+def _quant_fp8_rowwise(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-output-channel e4m3 quantization of a (N, K) weight.
+
+    Returns the fp8 weight (N, K) and a (1, N) fp32 scale laid out for
+    ``torch._scaled_mm``'s rowwise scale_b."""
+    amax = w.detach().abs().amax(dim=1, keepdim=True).float().clamp_(min=1e-12)
+    scale = amax / _FP8_MAX
+    wq = (w.float() / scale).clamp_(-_FP8_MAX, _FP8_MAX).to(_FP8_DTYPE)
+    return wq, scale.t().contiguous()
+
+
+def _fp8_linear(
+    x: torch.Tensor, wq: torch.Tensor, w_scale: torch.Tensor
+) -> torch.Tensor:
+    """W8A8 e4m3 GEMM: dynamic per-token activation scales (M, 1) x
+    per-channel weight scales (1, N) via cuBLASLt rowwise scaled_mm."""
+    amax = x.abs().amax(dim=-1, keepdim=True).float().clamp(min=1e-6)
+    x_scale = amax / _FP8_MAX
+    xq = (x.float() / x_scale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8_DTYPE)
+    return torch._scaled_mm(
+        xq, wq.t(), scale_a=x_scale, scale_b=w_scale, out_dtype=x.dtype
+    )
 
 
 class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE):
@@ -169,6 +219,7 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
         loaded = super().load_weights(base_weights())
         logger.info("Orthrus: loaded %d diff tensors", len(diff_loaded))
         self._fuse_diff_projections()
+        self._quantize_draft_weights()
         return loaded | diff_loaded
 
     def _fuse_diff_projections(self) -> None:
@@ -214,6 +265,69 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
                     dn.in_proj_a_diff,
                 )
         torch.cuda.empty_cache()
+
+    def _quantize_draft_weights(self) -> None:
+        """fp8-quantize the drafter-path GEMM weights (ORTHRUS_FP8_DRAFT).
+
+        ``diff``: the *_diff projections are drafter-only, so they are
+        quantized in place (halves their footprint). ``full``: additionally
+        make fp8 *copies* of the weights the diffusion pass shares with the
+        AR/verify path (per-layer MLP, lm_head) — the AR path must stay
+        bf16-exact, so the originals are untouched. Runs before vLLM's KV
+        memory profiling, so the extra footprint is accounted for
+        automatically."""
+        mode = os.environ.get("ORTHRUS_FP8_DRAFT", "0").lower()
+        if mode in ("0", "", "off"):
+            return
+        full = mode in ("1", "full", "all")
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            if layer.layer_type == "full_attention":
+                attn = layer.self_attn
+                attn.diff_qkv_weight_q, attn.diff_qkv_weight_s = (
+                    _quant_fp8_rowwise(attn.diff_qkv_weight)
+                )
+                del attn.diff_qkv_weight
+                attn.o_proj_diff_q, attn.o_proj_diff_s = _quant_fp8_rowwise(
+                    attn.o_proj_diff.weight
+                )
+                del attn.o_proj_diff
+            elif layer.layer_type == "linear_attention":
+                dn = layer.linear_attn
+                dn.diff_in_weight_q, dn.diff_in_weight_s = _quant_fp8_rowwise(
+                    dn.diff_in_weight
+                )
+                del dn.diff_in_weight
+                dn.out_proj_diff_q, dn.out_proj_diff_s = _quant_fp8_rowwise(
+                    dn.out_proj_diff.weight
+                )
+                del dn.out_proj_diff
+            if full:
+                mlp = layer.mlp
+                mlp.draft_gate_up_q, mlp.draft_gate_up_s = _quant_fp8_rowwise(
+                    mlp.gate_up_proj.weight
+                )
+                mlp.draft_down_q, mlp.draft_down_s = _quant_fp8_rowwise(
+                    mlp.down_proj.weight
+                )
+        if full:
+            # Slice off vocab padding so an fp8 argmax can never return a
+            # padding token id (padded rows quantize to logit 0, which could
+            # win when every real logit is negative).
+            vocab = getattr(
+                self.lm_head, "org_vocab_size", self.lm_head.weight.shape[0]
+            )
+            self.draft_lm_head_q, self.draft_lm_head_s = _quant_fp8_rowwise(
+                self.lm_head.weight[:vocab]
+            )
+        torch.cuda.empty_cache()
+        logger.info(
+            "Orthrus: fp8 draft weights ready (mode=%s, shared MLP/lm_head "
+            "copies=%s)",
+            mode,
+            full,
+        )
 
     # ------------------------------------------------------------------
     # Orthrus diffusion forward (M1: dense-fallback attention, bs=1, eager)
@@ -287,7 +401,8 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
         hidden = self.model.embed_tokens(input_ids)
         for layer in self.model.layers:
             residual = hidden
-            h = layer.input_layernorm(hidden)
+            ln = layer.input_layernorm
+            h = _gemma_rms(hidden, ln.weight, ln.variance_epsilon)
             if layer.layer_type == "linear_attention":
                 idx = gdn_state_indices[layer.layer_idx]
                 conv_idx, ssm_idx = idx if isinstance(idx, tuple) else (idx, idx)
@@ -306,10 +421,22 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
                 )
             hidden = residual + h
             residual = hidden
-            h = layer.post_attention_layernorm(hidden)
-            h = layer.mlp(h)
+            ln = layer.post_attention_layernorm
+            h = _gemma_rms(hidden, ln.weight, ln.variance_epsilon)
+            mlp = layer.mlp
+            if getattr(mlp, "draft_gate_up_q", None) is not None:
+                gu = _fp8_linear(h, mlp.draft_gate_up_q, mlp.draft_gate_up_s)
+                half = gu.shape[-1] // 2
+                h = F.silu(gu[..., :half]) * gu[..., half:]
+                h = _fp8_linear(h, mlp.draft_down_q, mlp.draft_down_s)
+            else:
+                h = mlp(h)
             hidden = residual + h
-        hidden = self.model.norm(hidden)
+        hidden = _gemma_rms(
+            hidden, self.model.norm.weight, self.model.norm.variance_epsilon
+        )
+        if getattr(self, "draft_lm_head_q", None) is not None:
+            return _fp8_linear(hidden, self.draft_lm_head_q, self.draft_lm_head_s)
         return self.compute_logits(hidden)
 
     def _attn_diffusion(
@@ -334,7 +461,10 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
         num_kv_heads = attn.num_kv_heads
         head_dim = attn.head_dim
 
-        qkv = F.linear(h, attn.diff_qkv_weight)
+        if getattr(attn, "diff_qkv_weight_q", None) is not None:
+            qkv = _fp8_linear(h, attn.diff_qkv_weight_q, attn.diff_qkv_weight_s)
+        else:
+            qkv = F.linear(h, attn.diff_qkv_weight)
         qg, k, v = qkv.split(
             [
                 num_heads * head_dim * 2,
@@ -345,8 +475,16 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
         )
         q, gate = qg.view(num_tokens, num_heads, 2 * head_dim).chunk(2, dim=-1)
         gate = gate.reshape(num_tokens, num_heads * head_dim)
-        q = attn.q_norm_diff(q.contiguous())
-        k = attn.k_norm_diff(k.reshape(num_tokens, num_kv_heads, head_dim))
+        q = _gemma_rms(
+            q.contiguous(),
+            attn.q_norm_diff.weight,
+            attn.q_norm_diff.variance_epsilon,
+        )
+        k = _gemma_rms(
+            k.reshape(num_tokens, num_kv_heads, head_dim),
+            attn.k_norm_diff.weight,
+            attn.k_norm_diff.variance_epsilon,
+        )
         v = v.view(num_tokens, num_kv_heads, head_dim)
         q, k = attn.rotary_emb(
             positions, q.reshape(num_tokens, -1), k.reshape(num_tokens, -1)
@@ -370,6 +508,8 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
         )
         out = out.squeeze(0).transpose(0, 1).reshape(num_tokens, num_heads * head_dim)
         out = out * torch.sigmoid(gate)
+        if getattr(attn, "o_proj_diff_q", None) is not None:
+            return _fp8_linear(out, attn.o_proj_diff_q, attn.o_proj_diff_s)
         return attn.o_proj_diff(out)
 
     @staticmethod
@@ -427,7 +567,10 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
         Static (graph-capturable) mode: ``conv_state_idx``/``ssm_state_idx``
         are (1,) device tensors and ``conv_offset`` a 0-dim device tensor."""
         num_tokens = h.shape[0]
-        proj = F.linear(h, dn.diff_in_weight)
+        if getattr(dn, "diff_in_weight_q", None) is not None:
+            proj = _fp8_linear(h, dn.diff_in_weight_q, dn.diff_in_weight_s)
+        else:
+            proj = F.linear(h, dn.diff_in_weight)
         mixed, z_flat, b_raw, a_raw = proj.split(
             [dn.conv_dim, dn.value_dim, dn.num_v_heads, dn.num_v_heads], dim=-1
         )
@@ -482,29 +625,53 @@ class OrthrusQwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE)
             init_fwd = ssm_pool.index_select(0, ssm_state_idx)
         else:
             init_fwd = ssm_pool[ssm_state_idx].unsqueeze(0)
-        q2 = torch.cat([q, torch.flip(q, dims=[1])], dim=0)
-        k2 = torch.cat([k, torch.flip(k, dims=[1])], dim=0)
-        v2 = torch.cat([v, torch.flip(v, dims=[1])], dim=0)
-        g2 = torch.cat([g, torch.flip(g, dims=[1])], dim=0)
-        b2 = torch.cat([beta, torch.flip(beta, dims=[1])], dim=0)
-        init2 = torch.cat([init_fwd, torch.zeros_like(init_fwd)], dim=0)
+        if _FWD_ONLY_SCAN:
+            out2, _ = chunk_gated_delta_rule(
+                q,
+                k,
+                v,
+                g=g,
+                beta=beta,
+                initial_state=init_fwd,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=True,
+            )
+            core = out2[0]  # (K, H, head_v_dim)
+        else:
+            q2 = torch.cat([q, torch.flip(q, dims=[1])], dim=0)
+            k2 = torch.cat([k, torch.flip(k, dims=[1])], dim=0)
+            v2 = torch.cat([v, torch.flip(v, dims=[1])], dim=0)
+            g2 = torch.cat([g, torch.flip(g, dims=[1])], dim=0)
+            b2 = torch.cat([beta, torch.flip(beta, dims=[1])], dim=0)
+            init2 = torch.cat([init_fwd, torch.zeros_like(init_fwd)], dim=0)
 
-        out2, _ = chunk_gated_delta_rule(
-            q2,
-            k2,
-            v2,
-            g=g2,
-            beta=b2,
-            initial_state=init2,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=True,
-        )
-        core = out2[0] + torch.flip(out2[1], dims=[0])  # (K, H, head_v_dim)
+            out2, _ = chunk_gated_delta_rule(
+                q2,
+                k2,
+                v2,
+                g=g2,
+                beta=b2,
+                initial_state=init2,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=True,
+            )
+            core = out2[0] + torch.flip(out2[1], dims=[0])  # (K, H, head_v_dim)
 
         z = z_flat.reshape(-1, dn.head_v_dim)
         core = core.reshape(-1, dn.head_v_dim)
-        core = dn.norm(core, z)
+        # Inline the gated RMS norm (same math as RMSNormGated.forward_static)
+        # so it fuses into the compiled drafter graph instead of running as
+        # standalone eager kernels at the FLA graph break.
+        nw = dn.norm
+        cf = core.float()
+        cf = cf * torch.rsqrt(cf.pow(2).mean(dim=-1, keepdim=True) + nw.eps)
+        cf = cf * nw.weight.float()
+        zf = z.float()
+        gate = torch.sigmoid(zf) if nw.activation == "sigmoid" else F.silu(zf)
+        core = (cf * gate).to(core.dtype)
         core = core.reshape(num_tokens, dn.value_dim)
+        if getattr(dn, "out_proj_diff_q", None) is not None:
+            return _fp8_linear(core, dn.out_proj_diff_q, dn.out_proj_diff_s)
         return dn.out_proj_diff(core)
 
     @classmethod
