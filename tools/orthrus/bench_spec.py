@@ -40,6 +40,8 @@ def main() -> None:
     ap.add_argument("--reference", default=None,
                     help="JSON from smoke_generate.py for lossless check")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--eager", action="store_true",
+                    help="enforce_eager (M1 mode); default is cudagraphs")
     args = ap.parse_args()
 
     from vllm import LLM, SamplingParams
@@ -52,7 +54,7 @@ def main() -> None:
         }
     llm = LLM(
         model=os.path.expanduser(args.model),
-        enforce_eager=True,
+        enforce_eager=args.eager,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=0.85,
         max_num_seqs=1,
