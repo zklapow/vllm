@@ -46,6 +46,29 @@ python tools/orthrus/parity_compare.py \
   --vllm ~/orthrus_m1/parity_vllm.pt --proto ~/orthrus_m1/parity_proto.pt
 ```
 
+## Increment 3/4 — speculative decoding end to end
+```
+VLLM_ENABLE_V1_MULTIPROCESSING=0 CUDA_VISIBLE_DEVICES=6 \
+  PATH=$HOME/vllm-dev-env/bin:$PATH \
+  ~/vllm-dev-env/bin/python tools/orthrus/bench_spec.py \
+    --model ~/checkpoints/orthrus/run17_27b/export_hf --k 16 \
+    --reference ~/orthrus_m1/smoke_orthrus.json
+```
+Serving: `vllm serve <export_hf> --speculative-config
+'{"method": "orthrus", "num_speculative_tokens": 15}' --enforce-eager`.
+
+M1 results (2026-06-12, B200 GPU 6, bs=1 greedy, 128 tok, demo prompts,
+all eager):
+- AR baseline (this fork, eager): 25.8 tok/s
+- Orthrus K=8:  36.3 tok/s (1.41x), 3.23 accepted drafts/cycle, lossless 3/3
+- Orthrus K=16: 38.1 tok/s (1.48x), 3.42 accepted drafts/cycle, lossless 3/3
+- Orthrus K=32: 38.6 tok/s (1.50x), 3.57 accepted drafts/cycle, lossless 3/3
+- `vllm serve` (multiproc engine, K=16): 37.7 tok/s over HTTP, lossless 3/3;
+  vLLM SpecDecoding metrics report mean acceptance length 4.60
+- (banked cudagraph numbers from the 0.22.1 server for context: AR 89.7,
+  MTP k=4 ~236 tok/s — closing that gap is M2/M3 work: cudagraph capture,
+  batched diffusion, paged Option-A attention)
+
 ## Notes / gotchas discovered
 - Internal request ids are randomized; `LLMEngine.add_request` returns the
   internal id (keys `runner.requests`), `RequestOutput.request_id` is the
